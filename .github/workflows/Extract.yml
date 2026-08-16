@@ -1,0 +1,266 @@
+name: Extract jsm-knowledge-sync
+
+on:
+  workflow_dispatch:
+
+# ここで指定できるのはGITHUB_TOKENの権限です。
+# 実際のpushにはHARNESS_PUSH_TOKENを使用します。
+permissions:
+  contents: read
+
+concurrency:
+  group: extract-codex-agent-harness-v3-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZIP_FILE: jsm-knowledge-sync.zip
+
+jobs:
+  extract-and-commit:
+    name: Extract ZIP and commit files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check push token
+        shell: bash
+        env:
+          HARNESS_PUSH_TOKEN: ${{ secrets.HARNESS_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HARNESS_PUSH_TOKEN}" ]]; then
+            echo "::error::Repository Secret HARNESS_PUSH_TOKEN が設定されていません。"
+            exit 1
+          fi
+
+          echo "HARNESS_PUSH_TOKEN is configured."
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+          # .github/workflows配下を更新できる
+          # Fine-grained PATを使用します。
+          token: ${{ secrets.HARNESS_PUSH_TOKEN }}
+
+          # 後続のgit fetch、git rebase、git pushでも
+          # 上記PATを使用できるようにします。
+          persist-credentials: true
+
+      - name: Check required commands
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for command_name in unzip rsync python3 git; do
+            if ! command -v "${command_name}" >/dev/null 2>&1; then
+              echo "::error::Required command not found: ${command_name}"
+              exit 1
+            fi
+          done
+
+      - name: Check ZIP file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "${ZIP_FILE}" ]]; then
+            echo "::error::${ZIP_FILE} がリポジトリ直下に存在しません。"
+            exit 1
+          fi
+
+          echo "ZIP file found: ${ZIP_FILE}"
+
+      - name: Validate ZIP entries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import sys
+          import zipfile
+          from pathlib import PurePosixPath
+
+          zip_file = os.environ["ZIP_FILE"]
+
+          try:
+              with zipfile.ZipFile(zip_file) as archive:
+                  if not archive.namelist():
+                      print(
+                          f"ZIP file is empty: {zip_file}",
+                          file=sys.stderr,
+                      )
+                      sys.exit(1)
+
+                  for entry in archive.namelist():
+                      normalized = entry.replace("\\", "/")
+                      path = PurePosixPath(normalized)
+
+                      if path.is_absolute() or ".." in path.parts:
+                          print(
+                              f"Unsafe ZIP entry detected: {entry}",
+                              file=sys.stderr,
+                          )
+                          sys.exit(1)
+
+              print("ZIP entries are valid.")
+
+          except zipfile.BadZipFile:
+              print(
+                  f"Invalid ZIP file: {zip_file}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRACT_DIR="${RUNNER_TEMP}/codex-agent-harness-v3-ja"
+
+          rm -rf "${EXTRACT_DIR}"
+          mkdir -p "${EXTRACT_DIR}"
+
+          unzip -q -o "${ZIP_FILE}" -d "${EXTRACT_DIR}"
+
+          echo "ZIP extracted to: ${EXTRACT_DIR}"
+
+          echo "Extracted files:"
+          find "${EXTRACT_DIR}" \
+            -mindepth 1 \
+            -maxdepth 3 \
+            -print
+
+      - name: Detect source directory
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRACT_DIR="${RUNNER_TEMP}/codex-agent-harness-v3-ja"
+
+          # 隠しファイル・隠しディレクトリも配列に含めます。
+          shopt -s dotglob nullglob
+
+          entries=("${EXTRACT_DIR}"/*)
+
+          if [[ ${#entries[@]} -eq 0 ]]; then
+            echo "::error::ZIPの展開結果が空です。"
+            exit 1
+          fi
+
+          # ZIP内が単一のルートディレクトリになっている場合は、
+          # そのディレクトリの中身をリポジトリ直下へ配置します。
+          if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+            SOURCE_DIR="${entries[0]}"
+            echo "Single root directory detected: ${SOURCE_DIR}"
+          else
+            SOURCE_DIR="${EXTRACT_DIR}"
+            echo "Multiple root entries detected."
+            echo "Source directory: ${SOURCE_DIR}"
+          fi
+
+          echo "source_dir=${SOURCE_DIR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Copy extracted files to repository
+        shell: bash
+        env:
+          SOURCE_DIR: ${{ steps.source.outputs.source_dir }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SOURCE_DIR}" || ! -d "${SOURCE_DIR}" ]]; then
+            echo "::error::コピー元ディレクトリが存在しません: ${SOURCE_DIR}"
+            exit 1
+          fi
+
+          # "${SOURCE_DIR}/" の末尾のスラッシュにより、
+          # SOURCE_DIR自体ではなく、その中身をコピーします。
+          #
+          # rsyncは通常ファイルだけでなく、
+          # .github、.codex、.gitignoreなどもコピーします。
+          #
+          # ZIP内に.gitが含まれていても、
+          # 現在のリポジトリ情報は上書きしません。
+          rsync \
+            --archive \
+            --verbose \
+            --exclude=".git" \
+            --exclude=".git/" \
+            "${SOURCE_DIR}/" \
+            "${GITHUB_WORKSPACE}/"
+
+      - name: Remove ZIP file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -f "${ZIP_FILE}"
+
+          echo "Removed ZIP file: ${ZIP_FILE}"
+
+      - name: Show repository changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Git status:"
+          git status --short --untracked-files=all
+
+      - name: Commit changes
+        id: commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 削除、変更、新規ファイルをすべてステージングします。
+          git add --all
+
+          if git diff --cached --quiet; then
+            echo "コミット対象の変更はありません。"
+            echo "created=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Files to commit:"
+          git diff --cached --name-status
+
+          git commit \
+            -m "chore: extract Codex Agent Harness v3"
+
+          echo "created=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Rebase onto latest remote branch
+        if: steps.commit.outputs.created == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+
+          git fetch origin "${BRANCH_NAME}"
+
+          # ワークフロー実行中に同じブランチが更新されていた場合、
+          # 最新のリモートブランチ上へコミットを載せ直します。
+          git rebase "origin/${BRANCH_NAME}"
+
+      - name: Push changes
+        if: steps.commit.outputs.created == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+
+          git push origin "HEAD:${BRANCH_NAME}"
+
+          echo "Changes pushed to branch: ${BRANCH_NAME}"
