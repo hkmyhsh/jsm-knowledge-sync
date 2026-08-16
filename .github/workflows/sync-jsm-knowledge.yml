@@ -1,0 +1,139 @@
+name: Sync JSM knowledge
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_key:
+        description: "特定の1件だけ同期する場合のJSM課題キー（例: ITSD-123）"
+        required: false
+        type: string
+      jql:
+        description: "今回だけ利用するJQL（空欄ならRepository variableのJSM_JQL）"
+        required: false
+        type: string
+  repository_dispatch:
+    types: [jsm_knowledge_sync]
+  schedule:
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: jsm-knowledge-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  SYNC_BRANCH: automation/jsm-knowledge
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Continue existing knowledge PR branch
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth_header="Authorization: Bearer ${GH_TOKEN}"
+          if git -c http.extraHeader="${auth_header}" ls-remote --exit-code --heads origin "${SYNC_BRANCH}" >/dev/null 2>&1; then
+            git -c http.extraHeader="${auth_header}" fetch origin "${SYNC_BRANCH}"
+            git checkout -B "${SYNC_BRANCH}" FETCH_HEAD
+          else
+            git checkout -b "${SYNC_BRANCH}"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Fetch target requests and public comments
+        id: fetch
+        env:
+          JSM_BASE_URL: ${{ secrets.JSM_BASE_URL }}
+          JSM_EMAIL: ${{ secrets.JSM_EMAIL }}
+          JSM_API_TOKEN: ${{ secrets.JSM_API_TOKEN }}
+          JSM_AUTH_MODE: ${{ vars.JSM_AUTH_MODE || 'basic' }}
+          JSM_JQL: ${{ inputs.jql || vars.JSM_JQL }}
+          JSM_ISSUE_KEY: ${{ github.event.client_payload.issue_key || inputs.issue_key || '' }}
+          JSM_MAX_ISSUES: ${{ vars.JSM_MAX_ISSUES || '100' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .work
+          python scripts/fetch_jsm.py --output .work/jsm_issues.json
+          count="$(python -c 'import json; print(len(json.load(open(".work/jsm_issues.json", encoding="utf-8"))["issues"]))')"
+          echo "issue_count=${count}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run Codex to update knowledge
+        if: steps.fetch.outputs.issue_count != '0'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/prompts/summarize-jsm.md
+          output-file: .work/codex-result.md
+          sandbox: workspace-write
+          safety-strategy: drop-sudo
+          codex-args: '["--ephemeral"]'
+          model: ${{ vars.CODEX_MODEL }}
+          effort: ${{ vars.CODEX_EFFORT || 'medium' }}
+
+      - name: Reject unexpected file changes
+        if: steps.fetch.outputs.issue_count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unexpected="$(git status --porcelain | awk '{print $2}' | grep -Ev '^(knowledge/|\.work/)' || true)"
+          if [[ -n "${unexpected}" ]]; then
+            echo "Codex changed files outside knowledge/:"
+            echo "${unexpected}"
+            exit 1
+          fi
+
+      - name: Validate generated knowledge
+        if: steps.fetch.outputs.issue_count != '0'
+        run: python scripts/validate_knowledge.py knowledge
+
+      - name: Commit, push, and open or update pull request
+        if: steps.fetch.outputs.issue_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add knowledge
+          if git diff --cached --quiet; then
+            echo "Knowledge is already up to date."
+            exit 0
+          fi
+
+          git config user.name "jsm-knowledge-bot"
+          git config user.email "jsm-knowledge-bot@users.noreply.github.com"
+          git commit -m "docs: sync JSM knowledge"
+
+          auth_header="Authorization: Bearer ${GH_TOKEN}"
+          git -c http.extraHeader="${auth_header}" push origin "HEAD:refs/heads/${SYNC_BRANCH}"
+
+          pr_number="$(gh pr list --head "${SYNC_BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [[ -z "${pr_number}" ]]; then
+            gh pr create \
+              --base "${BASE_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --title "docs: JSMナレッジを同期" \
+              --body "JSMの対象問い合わせと公開回答をCodexで整理した自動更新です。内容を確認してマージしてください。"
+          else
+            echo "Updated existing PR #${pr_number}."
+          fi
+
